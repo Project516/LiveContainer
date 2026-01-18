@@ -13,8 +13,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: refs/tags/3.6.1  # Ensures build 3.6.1 
 
       - name: Build the app (unsigned, custom bundle ID)
         run: |
