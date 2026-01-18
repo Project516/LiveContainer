@@ -3,12 +3,12 @@ name: Build LiveContainer IPA (Custom Bundle ID)
 on:
   push:
     branches:
-      - custom-id  
-  workflow_dispatch: 
+      - custom-id  # Change if your branch name is different
+  workflow_dispatch:  # Allows manual runs from GitHub UI
 
 jobs:
   build:
-    runs-on: macos-latest  
+    runs-on: macos-latest  # Or macos-14 if you prefer stability
 
     steps:
       - name: Checkout code
@@ -17,19 +17,20 @@ jobs:
       - name: Build the app (unsigned, custom bundle ID)
         run: |
           xcodebuild -project LiveContainer.xcodeproj \
-            -scheme LiveContainer \
+            -target LiveContainer \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath DerivedData \
             clean build \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
             PRODUCT_BUNDLE_IDENTIFIER="dev.project516.livecontainer"
 
       - name: Package unsigned IPA
         run: |
           mkdir -p Payload
-          cp -r DerivedData/Build/Products/Release-iphoneos/LiveContainer.app Payload/
+          cp -r DerivedData/Build/Products/Release-iphoneos/jump.app Payload/
           zip -qr LiveContainer-custom-unsigned.ipa Payload/
 
       - name: Upload IPA artifact
