@@ -1,0 +1,41 @@
+name: Build LiveContainer IPA (Custom Bundle ID)
+
+on:
+  push:
+    branches:
+      - custom-id  
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: macos-latest  
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/3.6.1  # Ensures build 3.6.1 
+
+      - name: Build the app (unsigned, custom bundle ID)
+        run: |
+          xcodebuild -project LiveContainer.xcodeproj \
+            -scheme LiveContainer \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath DerivedData \
+            clean build \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            PRODUCT_BUNDLE_IDENTIFIER="dev.project516.livecontainer"
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -r DerivedData/Build/Products/Release-iphoneos/LiveContainer.app Payload/
+          zip -qr LiveContainer-custom-unsigned.ipa Payload/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-custom-unsigned
+          path: LiveContainer-custom-unsigned.ipa
