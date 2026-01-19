@@ -16,26 +16,29 @@ jobs:
         with:
           submodules: recursive 
           fetch-depth: 0
-
-      - name: Patch Bundle ID
+      - name: Patch Bundle ID to dev.project516.livecontainer
         run: |
-          # Define IDs
           OLD_ID="com.kdt.livecontainer"
           NEW_ID="dev.project516.livecontainer"
           
           echo "Patching Bundle ID: $OLD_ID -> $NEW_ID"
-          
-          # 1. Patch Project file (build settings)
-          find . -name "project.pbxproj" -type f -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
-          
-          # 2. Patch Info.plist files (app metadata)
-          find . -name "Info.plist" -type f -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
-          
-          # 3. Patch Entitlements (CRITICAL for App Groups/JIT)
-          find . -name "*.entitlements" -type f -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
-          
-          # 4. Patch Source Code (if ID is hardcoded in Swift/ObjC)
-          grep -rl "$OLD_ID" . --exclude-dir=.git | xargs sed -i '' "s/$OLD_ID/$NEW_ID/g"
+
+          # Force 'C' locale to prevent byte sequence errors if a stray character is found
+          export LC_ALL=C
+
+          # ONLY patch specific text-based file extensions
+          # This avoids breaking binary files or images
+          find . -type f \( \
+            -name "*.pbxproj" \
+            -o -name "*.plist" \
+            -o -name "*.entitlements" \
+            -o -name "*.xcconfig" \
+            -o -name "*.swift" \
+            -o -name "*.m" \
+            -o -name "*.h" \
+            -o -name "*.c" \
+            -o -name "*.cpp" \
+          \) -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
 
       - name: Build with Xcode
         run: |
