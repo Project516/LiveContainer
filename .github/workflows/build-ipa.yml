@@ -1,9 +1,9 @@
 name: Build LiveContainer
 
 on:
-  workflow_dispatch: # Allows manual trigger
+  workflow_dispatch: 
   push:
-    branches: [ "ci-testing" ]
+    branches: [ "change-id" ]
 
 jobs:
   build:
@@ -16,7 +16,7 @@ jobs:
         with:
           submodules: recursive 
           fetch-depth: 0
-      - name: Patch Bundle ID to dev.project516.livecontainer
+      - name: Patch Bundle ID 
         run: |
           OLD_ID="com.kdt.livecontainer"
           NEW_ID="dev.project516.livecontainer"
@@ -65,5 +65,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer-Project516
+          name: LiveContainer
           path: LiveContainer.ipa
