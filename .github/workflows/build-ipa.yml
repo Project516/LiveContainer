@@ -1,0 +1,66 @@
+name: Build LiveContainer
+
+on:
+  workflow_dispatch: # Allows manual trigger
+  push:
+    branches: [ "ci-testing" ]
+
+jobs:
+  build:
+    name: Build and Package
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive 
+          fetch-depth: 0
+
+      - name: Patch Bundle ID
+        run: |
+          # Define IDs
+          OLD_ID="com.kdt.livecontainer"
+          NEW_ID="dev.project516.livecontainer"
+          
+          echo "Patching Bundle ID: $OLD_ID -> $NEW_ID"
+          
+          # 1. Patch Project file (build settings)
+          find . -name "project.pbxproj" -type f -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
+          
+          # 2. Patch Info.plist files (app metadata)
+          find . -name "Info.plist" -type f -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
+          
+          # 3. Patch Entitlements (CRITICAL for App Groups/JIT)
+          find . -name "*.entitlements" -type f -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
+          
+          # 4. Patch Source Code (if ID is hardcoded in Swift/ObjC)
+          grep -rl "$OLD_ID" . --exclude-dir=.git | xargs sed -i '' "s/$OLD_ID/$NEW_ID/g"
+
+      - name: Build with Xcode
+        run: |
+          # Build using the standard Release configuration
+          xcodebuild archive \
+            -project LiveContainer.xcodeproj \
+            -scheme LiveContainer \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/LiveContainer.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          # Extract .app from the archive we just built
+          cp -R build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app Payload/
+          
+          # Zip into .ipa
+          zip -r LiveContainer.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-Project516
+          path: LiveContainer.ipa
