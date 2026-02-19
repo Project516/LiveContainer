@@ -27,11 +27,8 @@ jobs:
           
           echo "Patching Bundle ID: $OLD_ID -> $NEW_ID"
 
-          # Force 'C' locale to prevent byte sequence errors if a stray character is found
           export LC_ALL=C
 
-          # ONLY patch specific text-based file extensions
-          # Includes .intentdefinition, .storyboard, and .xib for LiveContainer 3.7.0+
           find . -type f \( \
             -name "*.pbxproj" \
             -o -name "*.plist" \
@@ -49,24 +46,23 @@ jobs:
 
       - name: Build with Xcode
         run: |
-          # Build using the standard Release configuration
+          # Build using Ad-Hoc signing (-) to prevent App Intents extractor crashes
+          # STRIP_INSTALLED_PRODUCT=NO prevents symbol stripping that breaks metadata
           xcodebuild archive \
             -project LiveContainer.xcodeproj \
             -scheme LiveContainer \
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/LiveContainer.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
+            CODE_SIGNING_ALLOWED=YES \
+            STRIP_INSTALLED_PRODUCT=NO
 
       - name: Package IPA
         run: |
           mkdir -p Payload
-          # Extract .app from the archive we just built
           cp -R build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app Payload/
-          
-          # Zip into .ipa (-q prevents log spam)
           zip -rq LiveContainer.ipa Payload
 
       - name: Upload Artifact
