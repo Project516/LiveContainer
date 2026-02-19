@@ -16,6 +16,10 @@ jobs:
         with:
           submodules: recursive 
           fetch-depth: 0
+
+      - name: Show Xcode Version
+        run: xcodebuild -version
+
       - name: Patch Bundle ID 
         run: |
           OLD_ID="com.kdt.livecontainer"
@@ -27,7 +31,7 @@ jobs:
           export LC_ALL=C
 
           # ONLY patch specific text-based file extensions
-          # This avoids breaking binary files or images
+          # Includes .intentdefinition, .storyboard, and .xib for LiveContainer 3.7.0+
           find . -type f \( \
             -name "*.pbxproj" \
             -o -name "*.plist" \
@@ -38,6 +42,9 @@ jobs:
             -o -name "*.h" \
             -o -name "*.c" \
             -o -name "*.cpp" \
+            -o -name "*.intentdefinition" \
+            -o -name "*.storyboard" \
+            -o -name "*.xib" \
           \) -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
 
       - name: Build with Xcode
@@ -59,8 +66,8 @@ jobs:
           # Extract .app from the archive we just built
           cp -R build/LiveContainer.xcarchive/Products/Applications/LiveContainer.app Payload/
           
-          # Zip into .ipa
-          zip -r LiveContainer.ipa Payload
+          # Zip into .ipa (-q prevents log spam)
+          zip -rq LiveContainer.ipa Payload
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
