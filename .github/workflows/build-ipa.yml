@@ -1,0 +1,74 @@
+name: Build LiveContainer
+
+on:
+  workflow_dispatch: 
+  push:
+    branches: [ "change-id" ]
+
+jobs:
+  build:
+    name: Build and Package
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive 
+          fetch-depth: 0
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2'
+
+      - name: Patch Bundle ID and App Groups
+        run: |
+          OLD_ID="com.kdt.livecontainer"
+          NEW_ID="dev.project516.livecontainer"
+          
+          echo "Patching Bundle ID: $OLD_ID -> $NEW_ID"
+          export LC_ALL=C
+          
+          find . -type f \( \
+            -name "*.pbxproj" \
+            -o -name "*.plist" \
+            -o -name "*.entitlements" \
+            -o -name "*.xml" \
+            -o -name "*.xcconfig" \
+            -o -name "*.swift" \
+            -o -name "*.m" \
+            -o -name "*.h" \
+            -o -name "*.c" \
+            -o -name "*.cpp" \
+            -o -name "*.xcstrings" \
+            -o -name "*.json" \
+          \) -print0 | xargs -0 sed -i '' "s/$OLD_ID/$NEW_ID/g"
+
+      - name: Build with Xcode (Bypassing Archive Validation)
+        run: |
+          set -o pipefail
+          
+          xcodebuild build \
+            -project LiveContainer.xcodeproj \
+            -scheme LiveContainer \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENTITLEMENTS_REQUIRED=NO | xcbeautify
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/LiveContainer.app Payload/
+          zip -r LiveContainer.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer
+          path: LiveContainer.ipa
