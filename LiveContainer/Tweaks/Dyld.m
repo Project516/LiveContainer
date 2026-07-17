@@ -44,6 +44,18 @@ uint32_t guestAppSdkVersionSet = 0;
 bool (*orig_dyld_program_sdk_at_least)(void* dyldPtr, dyld_build_version_t version);
 uint32_t (*orig_dyld_get_program_sdk_version)(void* dyldPtr);
 
+mach_port_t excPort;
+void *exception_handler(void *unused);
+
+static void ensureBreakpointExceptionHandler(void) {
+    if (excPort) return;
+
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
+    mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND);
+    pthread_t thread;
+    pthread_create(&thread, NULL, exception_handler, NULL);
+}
+
 static void overwriteAppExecutableFileType(void) {
     struct mach_header_64* appImageMachOHeader = (struct mach_header_64*) orig_dyld_get_image_header(appMainImageIndex);
     kern_return_t kret = builtin_vm_protect(mach_task_self(), (vm_address_t)appImageMachOHeader, sizeof(appImageMachOHeader), false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
@@ -188,46 +200,43 @@ bool performHookDyldApi(const char* functionName, uint32_t adrpOffset, void** or
     
     uint32_t* baseAddr = dlsym(RTLD_DEFAULT, functionName);
     assert(baseAddr != 0);
-    /*
-     arm64e 26.4b1+ has extra 20 instructions between adrpOffset and adrp
-     arm64e
-     1ad450b90  e10300aa   mov     x1, x0
-     1ad450b94  487b2090   adrp    x8, dyld4::gAPIs
-     1ad450b98  000140f9   ldr     x0, [x8]  {dyld4::gAPIs} may contain offset
-     1ad450b9c  100040f9   ldr     x16, [x0]
-     1ad450ba0  f10300aa   mov     x17, x0
-     1ad450ba4  517fecf2   movk    x17, #0x63fa, lsl #0x30
-     1ad450ba8  301ac1da   autda   x16, x17
-     1ad450bac  114780d2   mov     x17, #0x238
-     1ad450bb0  1002118b   add     x16, x16, x17
-     1ad450bb4  020240f9   ldr     x2, [x16]
-     1ad450bb8  e30310aa   mov     x3, x16
-     1ad450bbc  f00303aa   mov     x16, x3
-     1ad450bc0  7085f3f2   movk    x16, #0x9c2b, lsl #0x30
-     1ad450bc4  50081fd7   braa    x2, x16
-
-     arm64
-     00000001ac934c80         mov        x1, x0
-     00000001ac934c84         adrp       x8, #0x1f462d000
-     00000001ac934c88         ldr        x0, [x8, #0xf88]                            ; __ZN5dyld45gDyldE
-     00000001ac934c8c         ldr        x8, [x0]
-     00000001ac934c90         ldr        x2, [x8, #0x258]
-     00000001ac934c94         br         x2
-     */
     uint32_t* adrpInstPtr = baseAddr + adrpOffset;
-    if ((*adrpInstPtr & 0x9f000000) != 0x90000000) {
-        adrpOffset += 20;
-        adrpInstPtr = baseAddr + adrpOffset;
+
+    // find the following instruction pattern: 1 adrp + 2 ldr
+    // adrp    x8, 0x1e6cf0000
+    // ldr     x0, [x8, #0x30]  {dyld4::gAPIs}
+    // ldr     x16, [x0]
+    
+    static long adrpExtraOffset = -1;
+    if(adrpExtraOffset == -1) {
+        // let't hope the function is not longer than 200 instructions
+        uint32_t* end = baseAddr + 200;
+        for(uint32_t* cur = adrpInstPtr;cur < end;++cur) {
+            if ((*cur & 0x9f000000) != 0x90000000) {
+                continue;
+            }
+            if ((*(cur+1) & 0xFFC00000) != 0xF9400000) {
+                continue;
+            }
+            if ((*(cur+2) & 0xFFC00000) != 0xF9400000) {
+                continue;
+            }
+            adrpExtraOffset = cur - adrpInstPtr;
+            break;
+        }
+        assert(adrpExtraOffset != -1);
     }
-    assert ((*adrpInstPtr & 0x9f000000) == 0x90000000);
-    void* gdyldPtr = (void*)aarch64_emulate_adrp_ldr(*adrpInstPtr, *(baseAddr + adrpOffset + 1), (uint64_t)(baseAddr + adrpOffset));
+    
+    adrpInstPtr += adrpExtraOffset;
+
+    void* gdyldPtr = (void*)aarch64_emulate_adrp_ldr(*adrpInstPtr, *(adrpInstPtr + 1), (uint64_t)adrpInstPtr);
     
     assert(gdyldPtr != 0);
     assert(*(void**)gdyldPtr != 0);
     void* vtablePtr = **(void***)gdyldPtr;
     
     void* vtableFunctionPtr = 0;
-    uint32_t* movInstPtr = baseAddr + adrpOffset + 6;
+    uint32_t* movInstPtr = adrpInstPtr + 6;
 
     if((*movInstPtr & 0x7F800000) == 0x52800000) {
         // arm64e, mov imm + add + ldr
@@ -239,7 +248,7 @@ bool performHookDyldApi(const char* functionName, uint32_t adrpOffset, void** or
         vtableFunctionPtr = vtablePtr + imm9;
     } else {
         // arm64
-        uint32_t* ldrInstPtr2 = baseAddr + adrpOffset + 3;
+        uint32_t* ldrInstPtr2 = adrpInstPtr + 3;
         assert((*ldrInstPtr2 & 0xBFC00000) == 0xB9400000);
         uint32_t size2 = (*ldrInstPtr2 & 0xC0000000) >> 30;
         uint32_t imm12_2 = (*ldrInstPtr2 & 0x3FFC00) >> 10;
@@ -248,10 +257,17 @@ bool performHookDyldApi(const char* functionName, uint32_t adrpOffset, void** or
 
     
     kern_return_t ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)vtableFunctionPtr, sizeof(uintptr_t), false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
-    assert(ret == KERN_SUCCESS);
+    if(ret != KERN_SUCCESS) {
+        assert(os_tpro_is_supported());
+        os_thread_self_restrict_tpro_to_rw();
+    }
     *origFunction = (void*)*(void**)vtableFunctionPtr;
     *(uint64_t*)vtableFunctionPtr = (uint64_t)hookFunction;
     builtin_vm_protect(mach_task_self(), (mach_vm_address_t)vtableFunctionPtr, sizeof(uintptr_t), false, PROT_READ);
+    if(ret != KERN_SUCCESS) {
+        assert(os_tpro_is_supported());
+        os_thread_self_restrict_tpro_to_ro();
+    }
     return true;
 }
 
@@ -259,14 +275,21 @@ bool initGuestSDKVersionInfo(void) {
     void* dyldBase = getDyldBase();
     // it seems Apple is constantly changing findVersionSetEquivalent's signature so we directly search sVersionMap instead
     uint32_t* versionMapPtr = getCachedSymbol(@"__ZN5dyld3L11sVersionMapE", dyldBase);
-    if(!versionMapPtr) {
+    // check if the cached pointer is valid in case dyld is swapped by Dopamine. #1454
+    if(!versionMapPtr || versionMapPtr[0] != 0x07db0901) {
 #if !TARGET_OS_SIMULATOR
         const char* dyldPath = "/usr/lib/dyld";
-        uint64_t offset = LCFindSymbolOffset(dyldPath, "__ZN5dyld3L11sVersionMapE");
+        uint64_t offset = 0;
+        if(@available(iOS 27.0, *)) {
+            offset = LCFindSymbolOffset(dyldPath, "__ZN5dyld311sVersionMapE");
+        } else {
+            offset = LCFindSymbolOffset(dyldPath, "__ZN5dyld3L11sVersionMapE");
+        }
 #else
         void *result = litehook_find_symbol(dyldBase, "__ZN5dyld3L11sVersionMapE");
         uint64_t offset = (uint64_t)result - (uint64_t)dyldBase;
 #endif
+        assert(offset);
         versionMapPtr = dyldBase + offset;
         saveCachedSymbol(@"__ZN5dyld3L11sVersionMapE", dyldBase, offset);
     }
@@ -388,49 +411,127 @@ void* getGuestAppHeader(void) {
 #define HOOK_LOCK_1ST_ARG
 #endif
 static void *lockPtrToIgnore;
+static mach_port_t tidToIgnore;
 void hook_libdyld_os_unfair_recursive_lock_lock_with_options(HOOK_LOCK_1ST_ARG void* lock, uint32_t options) {
     if(!lockPtrToIgnore) lockPtrToIgnore = lock;
-    if(lock != lockPtrToIgnore) {
+    if(lock != lockPtrToIgnore || tidToIgnore != mach_thread_self()) {
         os_unfair_recursive_lock_lock_with_options(lock, options);
     }
 }
 void hook_libdyld_os_unfair_recursive_lock_unlock(HOOK_LOCK_1ST_ARG void* lock) {
-    if(lock != lockPtrToIgnore) {
+    if(lock != lockPtrToIgnore || tidToIgnore != mach_thread_self()) {
         os_unfair_recursive_lock_unlock(lock);
     }
 }
 
+bool hook_libdyld_os_unfair_recursive_lock_trylock(HOOK_LOCK_1ST_ARG void* lock) {
+    if(!lockPtrToIgnore) lockPtrToIgnore = lock;
+    if(lock != lockPtrToIgnore || tidToIgnore != mach_thread_self()) {
+        return os_unfair_recursive_lock_trylock(lock);
+    }
+    return true;
+}
+
+static void* findDyldSymbolWithCache(NSString* symbolName, void** ptrStorage) {
+    if(*ptrStorage) {
+        return *ptrStorage;
+    }
+    void *dyldBase = getDyldBase();
+    *ptrStorage = getCachedSymbol(symbolName, dyldBase);
+    if(!*ptrStorage) {
+        void *dyldBase = getDyldBase();
+        uint64_t offset = LCFindSymbolOffset("/usr/lib/dyld", symbolName.UTF8String);
+        *ptrStorage = dyldBase + offset;
+        saveCachedSymbol(symbolName, dyldBase, offset);
+    }
+    return *ptrStorage;
+}
+
+// return index of that function in vtable
+int searchVtable(void** vtable, void *func) {
+    for(int i = 0; i < 100; ++i) {
+        if(vtable[i] == func) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void *dlopen_nolock(const char *path, int mode) {
+    tidToIgnore = mach_thread_self();
     const char *libdyldPath = "/usr/lib/system/libdyld.dylib";
     mach_header_u *libdyldHeader = LCGetLoadedImageHeader(0, libdyldPath);
     assert(libdyldHeader != NULL);
 #if !TARGET_OS_SIMULATOR
-    NSString *lockUnlockPtrName = @"dyld4::LibSystemHelpers::os_unfair_recursive_lock_lock_with_options";
-    void **lockUnlockPtr = getCachedSymbol(lockUnlockPtrName, libdyldHeader);
-    if(!lockUnlockPtr) {
+    NSString *lockPtrName = @"dyld4::LibSystemHelpers::os_unfair_recursive_lock_lock_with_options";
+    NSString *unlockPtrName = @"dyld4::LibSystemHelpers::os_unfair_recursive_lock_unlock_with_options";
+    NSString *tryLockPtrName = @"dyld4::LibSystemHelpers::os_unfair_recursive_lock_trylock";
+    void **lockPtr = getCachedSymbol(lockPtrName, libdyldHeader);
+    void **unlockPtr = getCachedSymbol(unlockPtrName, libdyldHeader);
+    void **trylockPtr = 0;
+    bool shouldPatchTrylock = false;
+    if(@available(iOS 26.5, *)) {
+        shouldPatchTrylock = true;
+        trylockPtr = getCachedSymbol(tryLockPtrName, libdyldHeader);
+    }
+    
+    if(!unlockPtr || !lockPtr || (shouldPatchTrylock && !trylockPtr)) {
         void **vtableLibSystemHelpers = litehook_find_dsc_symbol(libdyldPath, "__ZTVN5dyld416LibSystemHelpersE");
-        void *lockFunc = litehook_find_dsc_symbol(libdyldPath, "__ZNK5dyld416LibSystemHelpers42os_unfair_recursive_lock_lock_with_optionsEP26os_unfair_recursive_lock_s24os_unfair_lock_options_t");
-        void *unlockFunc = litehook_find_dsc_symbol(libdyldPath, "__ZNK5dyld416LibSystemHelpers31os_unfair_recursive_lock_unlockEP26os_unfair_recursive_lock_s");
         
-        // Find the pointers in vtable storing the lock and unlock functions, they must be there or this loop will hit unreadable memory region and crash
-        while(!lockUnlockPtr) {
-            if(vtableLibSystemHelpers[0] == lockFunc) {
-                lockUnlockPtr = vtableLibSystemHelpers;
-                // unlockPtr stands next to lockPtr in vtable
-                NSCAssert(vtableLibSystemHelpers[1] == unlockFunc, @"dyld has changed: lock and unlock functions are not next to each other");
-                break;
-            }
-            vtableLibSystemHelpers++;
+        if(!lockPtr) {
+            void *lockFunc = litehook_find_dsc_symbol(libdyldPath, "__ZNK5dyld416LibSystemHelpers42os_unfair_recursive_lock_lock_with_optionsEP26os_unfair_recursive_lock_s24os_unfair_lock_options_t");
+            int lockOffset = searchVtable(vtableLibSystemHelpers, lockFunc);
+            NSCAssert(lockOffset != -1, @"dyld has changed: lockOffset not found in vtable");
+            lockPtr = vtableLibSystemHelpers + lockOffset;
+            saveCachedSymbol(lockPtrName, libdyldHeader, (uintptr_t)lockPtr - (uintptr_t)libdyldHeader);
         }
-        saveCachedSymbol(lockUnlockPtrName, libdyldHeader, (uintptr_t)lockUnlockPtr - (uintptr_t)libdyldHeader);
+        
+        if(!unlockPtr) {
+            void *unlockFunc = litehook_find_dsc_symbol(libdyldPath, "__ZNK5dyld416LibSystemHelpers31os_unfair_recursive_lock_unlockEP26os_unfair_recursive_lock_s");
+            int unlockOffset = searchVtable(vtableLibSystemHelpers, unlockFunc);
+            NSCAssert(unlockOffset != -1, @"dyld has changed: unlockOffset not found in vtable");
+            unlockPtr = vtableLibSystemHelpers + unlockOffset;
+            saveCachedSymbol(unlockPtrName, libdyldHeader, (uintptr_t)unlockPtr - (uintptr_t)libdyldHeader);
+        }
+        
+        if(shouldPatchTrylock && !trylockPtr) {
+            // after 26.5b2 dyld4::RuntimeLocks::couldDlopenLock is added and called when dlopen is called with RTLD_NO_LOAD,
+            // which calls os_unfair_recursive_lock_trylock, so we should also hook that
+            void *tryLockFunc = litehook_find_dsc_symbol(libdyldPath, "__ZNK5dyld416LibSystemHelpers32os_unfair_recursive_lock_trylockEP26os_unfair_recursive_lock_s");
+            int trylockOffset = searchVtable(vtableLibSystemHelpers, tryLockFunc);
+            // in case people use b1, we don't use NSCAssert here
+            if(trylockOffset != -1) {
+                trylockPtr = vtableLibSystemHelpers + trylockOffset;
+                saveCachedSymbol(tryLockPtrName, libdyldHeader, (uintptr_t)trylockPtr - (uintptr_t)libdyldHeader);
+            } else {
+                NSLog(@"dyld has changed: trylockOffset not found in vtable");
+                shouldPatchTrylock = false;
+            }
+        }
     }
     
     kern_return_t ret;
-    ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)lockUnlockPtr, sizeof(uintptr_t[2]), false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
-    assert(ret == KERN_SUCCESS);
-    void *origLockPtr = lockUnlockPtr[0], *origUnlockPtr = lockUnlockPtr[1];
-    lockUnlockPtr[0] = hook_libdyld_os_unfair_recursive_lock_lock_with_options;
-    lockUnlockPtr[1] = hook_libdyld_os_unfair_recursive_lock_unlock;
+    mach_vm_address_t vtablePageStart = (mach_vm_address_t)((uint64_t)lockPtr & ~(16384 - 1));
+    
+    ret = builtin_vm_protect(mach_task_self(), vtablePageStart, 16384, false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
+    if(ret != KERN_SUCCESS) {
+        assert(os_tpro_is_supported());
+        os_thread_self_restrict_tpro_to_rw();
+    }
+    void *origLockPtr = *lockPtr, *origUnlockPtr = *unlockPtr, *origTryLockPtr = 0;
+    *lockPtr = hook_libdyld_os_unfair_recursive_lock_lock_with_options;
+    *unlockPtr = hook_libdyld_os_unfair_recursive_lock_unlock;
+    if(shouldPatchTrylock) {
+        origTryLockPtr = *trylockPtr;
+        *trylockPtr = hook_libdyld_os_unfair_recursive_lock_trylock;
+    }
+    
+    ret = builtin_vm_protect(mach_task_self(), vtablePageStart, 16384, false, PROT_READ);
+    if(ret != KERN_SUCCESS) {
+        assert(os_tpro_is_supported());
+        os_thread_self_restrict_tpro_to_rw();
+    }
+    
     void *result;
     if(hookedDlopen) {
         result = jitless_hook_dlopen(path, mode);
@@ -438,13 +539,22 @@ void *dlopen_nolock(const char *path, int mode) {
         result = dlopen(path, mode);
     }
     
-    ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)lockUnlockPtr, sizeof(uintptr_t[2]), false, PROT_READ | PROT_WRITE);
-    assert(ret == KERN_SUCCESS);
-    lockUnlockPtr[0] = origLockPtr;
-    lockUnlockPtr[1] = origUnlockPtr;
+    ret = builtin_vm_protect(mach_task_self(), vtablePageStart, 16384, false, PROT_READ | PROT_WRITE);
+    if(ret != KERN_SUCCESS) {
+        assert(os_tpro_is_supported());
+        os_thread_self_restrict_tpro_to_rw();
+    }
+    *lockPtr = origLockPtr;
+    *unlockPtr = origUnlockPtr;
+    if(shouldPatchTrylock) {
+        *trylockPtr = origTryLockPtr;
+    }
     
-    ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)lockUnlockPtr, sizeof(uintptr_t[2]), false, PROT_READ);
-    assert(ret == KERN_SUCCESS);
+    ret = builtin_vm_protect(mach_task_self(), vtablePageStart, 16384, false, PROT_READ);
+    if(ret != KERN_SUCCESS) {
+        assert(os_tpro_is_supported());
+        os_thread_self_restrict_tpro_to_rw();
+    }
 #else
     litehook_rebind_symbol(libdyldHeader, os_unfair_recursive_lock_lock_with_options, hook_libdyld_os_unfair_recursive_lock_lock_with_options, nil);
     litehook_rebind_symbol(libdyldHeader, os_unfair_recursive_lock_unlock, hook_libdyld_os_unfair_recursive_lock_unlock, nil);
@@ -457,19 +567,15 @@ void *dlopen_nolock(const char *path, int mode) {
 
 #pragma mark - Workaround `file system sandbox blocked mmap()`
 // when using multitask app in private container, we need to temporarily hook dyld's mmap
-mach_port_t excPort;
 void *exception_handler(void *unused) {
     mach_msg_server(mach_exc_server, sizeof(union __RequestUnion__catch_mach_exc_subsystem), excPort, MACH_MSG_OPTION_NONE);
     abort();
 }
 
 void *jitless_hook_dlopen(const char *path, int mode) {
+    searchDyldFunctions();
     if (!excPort) {
-        searchDyldFunctions();
-        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
-        mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND);
-        pthread_t thread;
-        pthread_create(&thread, NULL, exception_handler, NULL);
+        ensureBreakpointExceptionHandler();
     }
     
     // save old thread states
@@ -485,10 +591,9 @@ void *jitless_hook_dlopen(const char *path, int mode) {
     assert(masksCnt == 1);
     
     // hook dyld's mmap
-    arm_debug_state64_t hookDebugState = {
-        .__bvr = {(uint64_t)orig_dyld_mmap},
-        .__bcr = {0x1e5},
-    };
+    arm_debug_state64_t hookDebugState = origDebugState;
+    hookDebugState.__bvr[0] = (uint64_t)orig_dyld_mmap;
+    hookDebugState.__bcr[0] = 0x1e5;
     thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&hookDebugState, ARM_DEBUG_STATE64_COUNT);
     
     // fixup @loader_path since we cannot use musttail here
@@ -527,6 +632,40 @@ void* jitless_hook_mmap(void *addr, size_t len, int prot, int flags, int fd, off
     return map;
 }
 
+static void *machOChainedFixupsValidLinkedit;
+static void *machoErrorCtor;
+
+void bypass_seg_count_check(void (^block)(void)) {
+    void *validLinkedit = findDyldSymbolWithCache(@"__ZNK6mach_o13ChainedFixups13validLinkeditEybNSt3__14spanIKNS_13MappedSegmentELm18446744073709551615EEEb", &machOChainedFixupsValidLinkedit);
+    arm_debug_state64_t origValidLinkeditDebugState = {0};
+    exception_mask_t validLinkeditMask = EXC_MASK_BREAKPOINT;
+    mach_msg_type_number_t validLinkeditMasksCnt = 1;
+    exception_handler_t validLinkeditHandler = excPort;
+    exception_behavior_t validLinkeditBehavior = EXCEPTION_STATE | MACH_EXCEPTION_CODES;
+    thread_state_flavor_t validLinkeditFlavor = ARM_THREAD_STATE64;
+    mach_port_t thread = mach_thread_self();
+    if(validLinkedit) {
+        ensureBreakpointExceptionHandler();
+        validLinkeditHandler = excPort;
+        thread_get_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origValidLinkeditDebugState, &(mach_msg_type_number_t){ARM_DEBUG_STATE64_COUNT});
+        thread_swap_exception_ports(thread, validLinkeditMask, validLinkeditHandler, validLinkeditBehavior, validLinkeditFlavor, &validLinkeditMask, &validLinkeditMasksCnt, &validLinkeditHandler, &validLinkeditBehavior, &validLinkeditFlavor);
+        assert(validLinkeditMasksCnt == 1);
+
+        arm_debug_state64_t hookDebugState = origValidLinkeditDebugState;
+        hookDebugState.__bvr[1] = (uint64_t)validLinkedit;
+        hookDebugState.__bcr[1] = 0x1e5;
+        thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&hookDebugState, ARM_DEBUG_STATE64_COUNT);
+    }
+
+    block();
+    
+    if(validLinkedit) {
+        thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origValidLinkeditDebugState, ARM_DEBUG_STATE64_COUNT);
+        thread_swap_exception_ports(thread, validLinkeditMask, validLinkeditHandler, validLinkeditBehavior, validLinkeditFlavor, &validLinkeditMask, &validLinkeditMasksCnt, &validLinkeditHandler, &validLinkeditBehavior, &validLinkeditFlavor);
+    }
+}
+
+
 kern_return_t catch_mach_exception_raise_state( mach_port_t exception_port, exception_type_t exception, const mach_exception_data_t code, mach_msg_type_number_t codeCnt, int *flavor, const thread_state_t old_state, mach_msg_type_number_t old_stateCnt, thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
     arm_thread_state64_t *old = (arm_thread_state64_t *)old_state;
     arm_thread_state64_t *new = (arm_thread_state64_t *)new_state;
@@ -536,6 +675,17 @@ kern_return_t catch_mach_exception_raise_state( mach_port_t exception_port, exce
         *new = *old;
         *new_stateCnt = old_stateCnt;
         arm_thread_state64_set_pc_fptr(*new, jitless_hook_mmap);
+        return KERN_SUCCESS;
+    }
+    if(pc == (uint64_t)machOChainedFixupsValidLinkedit) {
+        *new = *old;
+        *new_stateCnt = old_stateCnt;
+        static char emptyValidLinkeditBuffer[100] = "Create an issue on LiveContainer GitHub if you see this.";
+        void (*ctor)(void* self, char* msg) = (void (*)(void*, char*))findDyldSymbolWithCache(@"__ZN6mach_o5ErrorC1EPKcz", &machoErrorCtor);
+        ctor((void *)old->__x[8], emptyValidLinkeditBuffer);
+        // not sure if this offset will change again
+        *(uint8_t *)(((void *)old->__x[8]) + 0xa0) = 0;
+        arm_thread_state64_set_pc_presigned_fptr(*new, arm_thread_state64_get_lr_fptr(*old) ?: (void *)arm_thread_state64_get_lr(*old));
         return KERN_SUCCESS;
     }
     NSLog(@"[DyldLVBypass] Unknown breakpoint at pc: %p", (void*)pc);

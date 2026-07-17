@@ -27,6 +27,7 @@ NSBundle* lcMainBundle;
 NSDictionary* guestAppInfo;
 NSDictionary* guestContainerInfo;
 NSString* lcGuestAppId;
+NSString* lcLaunchURL;
 bool isLiveProcess = false;
 bool isSharedBundle = false;
 bool isSideStore = false;
@@ -37,6 +38,9 @@ bool sideStoreExist = false;
     return lcUserDefaults;
 }
 + (instancetype)lcSharedDefaults {
+    if(!lcUserDefaults) {
+        lcSharedDefaults = [[NSUserDefaults alloc] initWithSuiteName: [LCSharedUtils appGroupID]];
+    }
     return lcSharedDefaults;
 }
 + (NSString *)lcAppGroupPath {
@@ -72,6 +76,9 @@ bool sideStoreExist = false;
 + (NSString*)lcGuestAppId {
     return lcGuestAppId;
 }
++ (NSString*)lcLaunchURL {
+    return lcLaunchURL;
+}
 @end
 
 static BOOL checkJITEnabled() {
@@ -106,18 +113,38 @@ void overwriteMainCFBundle(void) {
     // Overwrite CFBundleGetMainBundle
     uint32_t *pc = (uint32_t *)CFBundleGetMainBundle;
     void **mainBundleAddr = 0;
-    while (true) {
-        uint64_t addr = aarch64_get_tbnz_jump_address(*pc, (uint64_t)pc);
-        if (addr) {
-            // adrp <- pc-1
-            // tbnz <- pc
-            // ...
-            // ldr  <- addr
-            mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)addr, (uint64_t)(pc-1));
-            break;
+    
+#if !TARGET_OS_SIMULATOR
+    if(@available(iOS 27.0, *)) {
+        // at least in iOS 27.0 db1, the logic is inversed and the __mainBundle is right after the first tbz instruction
+        while (true) {
+            bool isTbz = ((*pc) & 0x7F000000) == 0x36000000;
+            if (isTbz) {
+                // adrp <- pc-1
+                // tbz <- pc
+                // ldr  <- addr
+                mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)(pc+1), (uint64_t)(pc-1));
+                break;
+            }
+            ++pc;
         }
-        ++pc;
+    } else {
+#endif
+        while (true) {
+            uint64_t addr = aarch64_get_tbnz_jump_address(*pc, (uint64_t)pc);
+            if (addr) {
+                // adrp <- pc-1
+                // tbnz <- pc
+                // ...
+                // ldr  <- addr
+                mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)addr, (uint64_t)(pc-1));
+                break;
+            }
+            ++pc;
+        }
+#if !TARGET_OS_SIMULATOR
     }
+#endif
     assert(mainBundleAddr != NULL);
     *mainBundleAddr = (__bridge void *)NSBundle.mainBundle._cfBundle;
 }
@@ -150,27 +177,45 @@ void overwriteMainNSBundle(NSBundle *newBundle) {
     assert(![NSBundle.mainBundle.executablePath isEqualToString:oldPath]);
 }
 
-int hook__NSGetExecutablePath_overwriteExecPath(char*** dyldApiInstancePtr, char* newPath, uint32_t* bufsize) {
+typedef struct {
+    void *gap_0x0[2];                  // 0x00, 0x08
+    char *mainExecutablePath_old;      // 0x10
+    void *gap_0x18;                    // 0x18
+    char *mainExecutablePath_18_4;     // 0x20
+    size_t mainExecutablePathLen_27_0; // 0x28
+} DyldConfig;
+typedef struct {
+    void *gap_0x0;
+    DyldConfig *dyldConfig;
+} DyldAPI;
+
+int hook__NSGetExecutablePath_overwriteExecPath(DyldAPI* dyldApiInstancePtr, char* newPath, uint32_t* bufsize) {
     assert(dyldApiInstancePtr != 0);
-    char** dyldConfig = dyldApiInstancePtr[1];
+    DyldConfig* dyldConfig = dyldApiInstancePtr->dyldConfig;
     assert(dyldConfig != 0);
     
     char** mainExecutablePathPtr = 0;
     // mainExecutablePath is at 0x10 for iOS 15~18.3.2, 0x20 for iOS 18.4+
-    if(dyldConfig[2] != 0 && dyldConfig[2][0] == '/') {
-        mainExecutablePathPtr = dyldConfig + 2;
-    } else if (dyldConfig[4] != 0 && dyldConfig[4][0] == '/') {
-        mainExecutablePathPtr = dyldConfig + 4;
+    if(dyldConfig->mainExecutablePath_old != 0 && dyldConfig->mainExecutablePath_old[0] == '/') {
+        mainExecutablePathPtr = &(dyldConfig->mainExecutablePath_old);
+    } else if (dyldConfig->mainExecutablePath_18_4 != 0 && dyldConfig->mainExecutablePath_18_4[0] == '/') {
+        mainExecutablePathPtr = &(dyldConfig->mainExecutablePath_18_4);
     } else {
         assert(mainExecutablePathPtr != 0);
     }
 
-    kern_return_t ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)mainExecutablePathPtr, sizeof(mainExecutablePathPtr), false, PROT_READ | PROT_WRITE);
+    kern_return_t ret = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)dyldConfig, sizeof(dyldConfig), false, PROT_READ | PROT_WRITE);
     if(ret != KERN_SUCCESS) {
         assert(os_tpro_is_supported());
         os_thread_self_restrict_tpro_to_rw();
     }
     *mainExecutablePathPtr = newPath;
+    
+    // in iOS 27, the length is also cached, it's at +0x28
+    if(@available(iOS 27.0, *)) {
+        dyldConfig->mainExecutablePathLen_27_0 = strlen(newPath);
+    }
+    
     if(ret != KERN_SUCCESS) {
         os_thread_self_restrict_tpro_to_ro();
     }
@@ -193,7 +238,7 @@ static void *getAppEntryPoint(void *handle) {
     const struct mach_header_64 *header = (struct mach_header_64 *)getGuestAppHeader();
     uint8_t *imageHeaderPtr = (uint8_t*)header + sizeof(struct mach_header_64);
     struct load_command *command = (struct load_command *)imageHeaderPtr;
-    for(int i = 0; i < header->ncmds > 0; ++i) {
+    for(int i = 0; i < header->ncmds; ++i) {
         if(command->cmd == LC_MAIN) {
             struct entry_point_command ucmd = *(struct entry_point_command *)imageHeaderPtr;
             entryoff = ucmd.entryoff;
@@ -214,7 +259,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     if (!LCSharedUtils.certificatePassword && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
         if(@available(iOS 26.0 ,*))  {
-            return @"JITLess mode is required since iOS 26. Please set it up in settings.";
+            return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
         }
 #endif
         // First of all, let's check if we have JIT
@@ -474,11 +519,25 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         NSFMGuestHooksInit();
         initDead10ccFix();
     }
+    if(isLiveProcess) {
+        NSURLSCGuestHooksInit();
+    }
     // ignore setting handler from guest app
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, NSSetUncaughtExceptionHandler, hook_do_nothing, nil);
     
     BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword && isLiveProcess;
     DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
+    
+    if([guestContainerInfo[@"spoofIdentifierForVendor"] boolValue]) {
+        NSString* idForVendorStr = guestContainerInfo[@"spoofedIdentifierForVendor"];
+        if([idForVendorStr isKindOfClass:NSString.class]) {
+            NSUUID* idForVendorUUID = [[NSUUID UUID] initWithUUIDString:idForVendorStr];
+            if(idForVendorUUID) {
+                IDFVHookInit(idForVendorUUID);
+            }
+        }
+    }
+    
 #if is32BitSupported
     bool is32bit = [guestAppInfo[@"is32bit"] boolValue];
     if(is32bit) {
@@ -510,7 +569,19 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     // Preload executable to bypass RT_NOLOAD
     appMainImageIndex = _dyld_image_count();
-    void *appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
+    __block void *appHandle = 0;
+    void (^dlopenBlock)(void) = ^{
+        appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
+    };
+    
+    BOOL is27up = false;
+    if(@available(iOS 27, *)) { is27up = true; }
+    if(is27up && [guestAppInfo[@"segCountMismatch"] boolValue]) {
+        bypass_seg_count_check(dlopenBlock);
+    } else {
+        dlopenBlock();
+    }
+
     appExecutableHandle = appHandle;
     const char *dlerr = dlerror();
     
@@ -527,7 +598,11 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     if([guestAppInfo[@"dontInjectTweakLoader"] boolValue] && ![guestAppInfo[@"dontLoadTweakLoader"] boolValue]) {
         tweakLoaderLoaded = true;
-        dlopen("@loader_path/../TweakLoader.dylib", RTLD_LAZY|RTLD_GLOBAL);
+        if([guestAppInfo[@"hideLiveContainer"] boolValue]) {
+            dlopen([lcMainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/TweakLoader.dylib"].UTF8String, RTLD_LAZY|RTLD_GLOBAL);
+        } else {
+            dlopen("@loader_path/../TweakLoader.dylib", RTLD_LAZY|RTLD_GLOBAL);
+        }
     }
     
     if(isSideStore) {
@@ -604,21 +679,29 @@ int LiveContainerMain(int argc, char *argv[]) {
 
     NSString *selectedApp = [lcUserDefaults stringForKey:@"selected"];
     NSString *selectedContainer = [lcUserDefaults stringForKey:@"selectedContainer"];
-    if(!selectedApp) {
-        NSString* selectedAppFromLaunchExtension = [lcSharedDefaults stringForKey:@"LCLaunchExtensionBundleID"];
-        
-        if(selectedAppFromLaunchExtension) {
-            NSDate* launchDate = [lcSharedDefaults objectForKey:@"LCLaunchExtensionLaunchDate"];
-            NSTimeInterval secondsSinceDate = [launchDate timeIntervalSinceNow];
-
-            if (secondsSinceDate < 0 && secondsSinceDate >= -3.0) {
-                selectedApp = selectedAppFromLaunchExtension;
-                selectedContainer = [lcSharedDefaults stringForKey:@"LCLaunchExtensionContainerName"];
-            }
-            [lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionBundleID"];
-            [lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionContainerName"];
+    NSString *launchUrl = nil;
+    do {
+        if(selectedApp) {
+            launchUrl = [lcUserDefaults stringForKey:@"launchAppUrlScheme"];
+            break;
         }
-    }
+        // check launch task in shared defaults
+        NSString* scheemFromLaunchExtension = [lcSharedDefaults stringForKey:@"LCLaunchExtensionScheme"];
+        if(![scheemFromLaunchExtension isEqualToString:lcAppUrlScheme]) break;
+        NSString* selectedAppFromLaunchExtension = [lcSharedDefaults stringForKey:@"LCLaunchExtensionBundleID"];
+        if(!selectedAppFromLaunchExtension) break;
+        NSDate* launchDate = [lcSharedDefaults objectForKey:@"LCLaunchExtensionLaunchDate"];
+        NSTimeInterval secondsSinceDate = [launchDate timeIntervalSinceNow];
+        if (secondsSinceDate >= 0 || secondsSinceDate < -3.0) break;
+        
+        selectedApp = selectedAppFromLaunchExtension;
+        selectedContainer = [lcSharedDefaults stringForKey:@"LCLaunchExtensionContainerName"];
+        launchUrl = [lcSharedDefaults stringForKey:@"LCLaunchExtensionLaunchURL"];
+        
+        [lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionBundleID"];
+        if (selectedContainer) [lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionContainerName"];
+        if (launchUrl) [lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionLaunchURL"];
+    } while (0);
     
     NSString* lastLaunchDataUUID;
     if(!isLiveProcess) {
@@ -721,24 +804,11 @@ int LiveContainerMain(int argc, char *argv[]) {
     }
     
     if (selectedApp || isSideStore) {
-        
-        NSString *launchUrl = [lcUserDefaults stringForKey:@"launchAppUrlScheme"];
         [lcUserDefaults removeObjectForKey:@"selected"];
         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
-        // wait for app to launch so that it can receive the url
         if(launchUrl) {
+            lcLaunchURL = launchUrl;
             [lcUserDefaults removeObjectForKey:@"launchAppUrlScheme"];
-            dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC));
-            dispatch_after(delay, dispatch_get_main_queue(), ^{
-                // Base64 encode the data
-                NSData *data = [launchUrl dataUsingEncoding:NSUTF8StringEncoding];
-                NSString *encodedUrl = [data base64EncodedStringWithOptions:0];
-                
-                NSString* finalUrl = [NSString stringWithFormat:@"%@://open-url?url=%@", lcAppUrlScheme, encodedUrl];
-                NSURL* url = [NSURL URLWithString: finalUrl];
-                
-                [[NSClassFromString(@"UIApplication") sharedApplication] openURL:url options:@{} completionHandler:nil];
-            });
         }
         NSSetUncaughtExceptionHandler(&exceptionHandler);
         NSString *appError = invokeAppMain(selectedApp, selectedContainer, argc, argv);
@@ -784,7 +854,7 @@ int LiveContainerMain(int argc, char *argv[]) {
     }
     
     void *LiveContainerSwiftUIHandle = dlopen("@executable_path/Frameworks/LiveContainerSwiftUI.framework/LiveContainerSwiftUI", RTLD_LAZY);
-    assert(LiveContainerSwiftUIHandle);
+    NSCAssert(LiveContainerSwiftUIHandle, @"%s", dlerror());
     
     if(sideStoreExist) {
         void* sideStoreHandle = dlopen("@executable_path/Frameworks/SideStore.framework/SideStore", RTLD_LAZY);
@@ -800,6 +870,10 @@ int LiveContainerMain(int argc, char *argv[]) {
             tweakFolder = [docPath stringByAppendingPathComponent:@"Tweaks"];
         }
         setenv("LC_GLOBAL_TWEAKS_FOLDER", tweakFolder.UTF8String, 1);
+#if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
+        extern void DyldHookLoadableIntoProcess(void);
+        DyldHookLoadableIntoProcess();
+#endif
         dlopen("@executable_path/Frameworks/TweakLoader.dylib", RTLD_LAZY);
     }
 
