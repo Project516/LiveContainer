@@ -153,6 +153,12 @@ final class AltStoreSourcesViewModel: ObservableObject {
     @Published private(set) var sources: [SourceItem] = []
     @Published var isRefreshingAll = false
     private let defaultsKey = "LCAltStoreSourceURLs"
+    private let defaultSourceURLs: [URL] = [
+        URL(string: "https://spectrumpit-stable.web.app/stable.json")!,
+        URL(string: "https://spectrumpit-nightly.web.app/nightly.json")!,
+        URL(string: "https://frcspectrumstrategy-stable.web.app/stable.json")!,
+        URL(string: "https://frcspectrumstrategy-nightly.web.app/nightly.json")!
+    ]
 
     private let cacheDirectoryName = "AltStoreSourceCache"
     
@@ -229,7 +235,14 @@ final class AltStoreSourcesViewModel: ObservableObject {
     private func loadStoredSources() {
         let defaults = UserDefaults.standard
         let stored = defaults.array(forKey: defaultsKey) as? [String] ?? []
-        let urls = stored.compactMap { URL(string: $0) }
+        var urls = stored.compactMap { URL(string: $0) }
+        if urls.isEmpty {
+            self.defaultSourceURLs.forEach { url in
+                if !urls.contains(url) {
+                    urls.append(url)
+                }
+            }
+        }
         self.sources = urls.map { SourceItem(url: $0, isLoading: false) }
         for index in sources.indices {
             let url = sources[index].url

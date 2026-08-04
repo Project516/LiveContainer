@@ -46,7 +46,7 @@
     }
     
     // in LC2, attempt to guess LC1's LiveProcess extension
-    NSString *bundleID = [NSString stringWithFormat:@"com.kdt.livecontainer.%@.LiveProcess", LCSharedUtils.teamIdentifier];
+    NSString *bundleID = [NSString stringWithFormat:@"org.spectrum3847.spectrum-mobile.%@.LiveProcess", LCSharedUtils.teamIdentifier];
     if([NSExtension extensionWithIdentifier:bundleID error:nil]) {
         return bundleID;
     }
@@ -223,7 +223,7 @@
 }
 
 + (void)changeMainExecutableTo:(NSString *)exec error:(NSError **)error {
-    NSURL *infoPath = [LCSharedUtils.appGroupPath URLByAppendingPathComponent:@"Apps/com.kdt.livecontainer/App.app/Info.plist"];
+    NSURL *infoPath = [LCSharedUtils.appGroupPath URLByAppendingPathComponent:@"Apps/org.spectrum3847.spectrum-mobile/App.app/Info.plist"];
     NSMutableDictionary *infoDict = [NSMutableDictionary dictionaryWithContentsOfURL:infoPath];
     if (!infoDict) return;
 
@@ -291,7 +291,7 @@
 
     infoDict[@"CFBundleDisplayName"] = newBundleName;
     infoDict[@"CFBundleName"] = newBundleName;
-    infoDict[@"CFBundleIdentifier"] = [NSString stringWithFormat:@"com.kdt.%@", newBundleName];
+    infoDict[@"CFBundleIdentifier"] = [NSString stringWithFormat:@"org.spectrum3847.%@", newBundleName];
     infoDict[@"CFBundleURLTypes"][0][@"CFBundleURLSchemes"][0] = [newBundleName lowercaseString];
     while([infoDict[@"CFBundleURLTypes"] count] > 1) {
         [infoDict[@"CFBundleURLTypes"] removeLastObject];
