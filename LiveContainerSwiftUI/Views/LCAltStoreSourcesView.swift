@@ -153,6 +153,10 @@ final class AltStoreSourcesViewModel: ObservableObject {
     @Published private(set) var sources: [SourceItem] = []
     @Published var isRefreshingAll = false
     private let defaultsKey = "LCAltStoreSourceURLs"
+    // Marks the one-time seeding of the Spectrum sources below. Without it,
+    // "no stored sources" and "the user removed every source" look the same, so
+    // clearing the list would bring all four back on the next launch.
+    private let didSeedDefaultsKey = "LCDidSeedSpectrumSourceURLs"
     private let defaultSourceURLs: [URL] = [
         URL(string: "https://spectrumpit-stable.web.app/stable.json")!,
         URL(string: "https://spectrumpit-nightly.web.app/nightly.json")!,
@@ -236,12 +240,10 @@ final class AltStoreSourcesViewModel: ObservableObject {
         let defaults = UserDefaults.standard
         let stored = defaults.array(forKey: defaultsKey) as? [String] ?? []
         var urls = stored.compactMap { URL(string: $0) }
-        if urls.isEmpty {
-            self.defaultSourceURLs.forEach { url in
-                if !urls.contains(url) {
-                    urls.append(url)
-                }
-            }
+        if !defaults.bool(forKey: didSeedDefaultsKey) {
+            urls = defaultSourceURLs + urls.filter { !defaultSourceURLs.contains($0) }
+            defaults.set(true, forKey: didSeedDefaultsKey)
+            defaults.set(urls.map { $0.absoluteString }, forKey: defaultsKey)
         }
         self.sources = urls.map { SourceItem(url: $0, isLoading: false) }
         for index in sources.indices {
