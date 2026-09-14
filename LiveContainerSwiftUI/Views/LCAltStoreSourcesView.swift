@@ -158,10 +158,11 @@ final class AltStoreSourcesViewModel: ObservableObject {
     // clearing the list would bring all four back on the next launch.
     private let didSeedDefaultsKey = "LCDidSeedSpectrumSourceURLs"
     private let defaultSourceURLs: [URL] = [
-        URL(string: "https://spectrumpit-stable.web.app/stable.json")!,
-        URL(string: "https://spectrumpit-nightly.web.app/nightly.json")!,
         URL(string: "https://frcspectrumstrategy-stable.web.app/stable.json")!,
-        URL(string: "https://frcspectrumstrategy-nightly.web.app/nightly.json")!
+        URL(string: "https://frcspectrumstrategy-nightly.web.app/nightly.json")!,
+        URL(string: "https://frcspectrumstrategy-pr.web.app/pr.json")!,
+        URL(string: "https://spectrumpit-stable.web.app/stable.json")!,
+        URL(string: "https://spectrumpit-nightly.web.app/nightly.json")!
     ]
 
     private let cacheDirectoryName = "AltStoreSourceCache"
