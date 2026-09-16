@@ -24,8 +24,8 @@ jobs:
 
       - name: Patch Bundle ID and App Groups
         run: |
-          OLD_ID="com.kdt.livecontainer"
-          NEW_ID="dev.project516.livecontainer"
+          OLD_ID="org.spectrum3847.spectrum-mobile"
+          NEW_ID="dev.project516.smobile"
           
           echo "Patching Bundle ID: $OLD_ID -> $NEW_ID"
           export LC_ALL=C
